@@ -15,7 +15,7 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: "MealMind — AI Cooking Planner",
   description:
-    "Generate a personalized full-day meal plan with grocery list, substitutions, and budget check — powered by Gemini AI.",
+    "Generate a personalized full-day meal plan with grocery list, substitutions, and budget check — powered by Groq AI with Gemini fallback.",
 };
 
 export default function RootLayout({

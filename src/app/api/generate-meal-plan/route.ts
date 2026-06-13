@@ -1,4 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
+import Groq from "groq-sdk";
+
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 interface UserInput {
   dayType: string;
@@ -8,6 +11,8 @@ interface UserInput {
   cuisinePreference: string;
   cookingSkill: string;
 }
+
+// ─── Prompt Builder ───────────────────────────────────────────────────────────
 
 function buildPrompt(input: UserInput): string {
   return `You are a professional meal planning assistant specialized in Indian and international cuisine.
@@ -110,68 +115,122 @@ Rules:
 9. category must be exactly one of: produce, dairy, protein, pantry, spices, grains`;
 }
 
+// ─── Groq (Primary) ───────────────────────────────────────────────────────────
+
+async function generateWithGroq(input: UserInput): Promise<string> {
+  const groqApiKey = process.env.GROQ_API_KEY;
+  if (!groqApiKey) {
+    throw new Error("GROQ_API_KEY is not configured in .env.local");
+  }
+
+  const groq = new Groq({ apiKey: groqApiKey });
+
+  const completion = await groq.chat.completions.create({
+    model: "llama-3.3-70b-versatile",
+    messages: [
+      {
+        role: "user",
+        content: buildPrompt(input),
+      },
+    ],
+    temperature: 0.7,
+    max_tokens: 8192,
+    response_format: { type: "json_object" },
+  });
+
+  const rawText = completion.choices[0]?.message?.content ?? "";
+  if (!rawText) {
+    throw new Error("Empty response from Groq");
+  }
+  return rawText;
+}
+
+// ─── Gemini (Fallback) ────────────────────────────────────────────────────────
+
+async function generateWithGemini(input: UserInput): Promise<string> {
+  const geminiApiKey = process.env.GEMINI_API_KEY;
+  if (!geminiApiKey) {
+    throw new Error("GEMINI_API_KEY is not configured in .env.local");
+  }
+
+  const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiApiKey}`;
+
+  const geminiResponse = await fetch(geminiUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [
+        {
+          parts: [{ text: buildPrompt(input) }],
+        },
+      ],
+      generationConfig: {
+        temperature: 0.7,
+        topK: 40,
+        topP: 0.95,
+        maxOutputTokens: 8192,
+        responseMimeType: "application/json",
+      },
+    }),
+  });
+
+  if (!geminiResponse.ok) {
+    const errorData = await geminiResponse.json();
+    throw new Error(
+      `Gemini API error: ${JSON.stringify(errorData)}`
+    );
+  }
+
+  const geminiData = await geminiResponse.json();
+  const rawText: string =
+    geminiData?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+
+  if (!rawText) {
+    throw new Error("Empty response from Gemini");
+  }
+  return rawText;
+}
+
+// ─── Route Handler ────────────────────────────────────────────────────────────
+
 export async function POST(req: NextRequest) {
   try {
     const body: UserInput = await req.json();
 
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      return NextResponse.json(
-        { error: "Gemini API key not configured. Add GEMINI_API_KEY to .env.local" },
-        { status: 500 }
+    let rawText: string;
+    let usedProvider: "groq" | "gemini" = "groq";
+
+    // ── 1. Try Groq first ──────────────────────────────────────────────────
+    try {
+      console.log("[MealMind] Attempting generation with Groq (primary)...");
+      rawText = await generateWithGroq(body);
+      console.log("[MealMind] ✅ Groq succeeded.");
+    } catch (groqError) {
+      // ── 2. Groq failed → fall back to Gemini ────────────────────────────
+      console.warn(
+        "[MealMind] ⚠️  Groq failed, falling back to Gemini. Reason:",
+        String(groqError)
       );
-    }
 
-    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
-
-    const geminiResponse = await fetch(geminiUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        contents: [
+      try {
+        rawText = await generateWithGemini(body);
+        usedProvider = "gemini";
+        console.log("[MealMind] ✅ Gemini fallback succeeded.");
+      } catch (geminiError) {
+        // Both providers failed — surface a clear error
+        console.error("[MealMind] ❌ Both Groq and Gemini failed.");
+        return NextResponse.json(
           {
-            parts: [
-              {
-                text: buildPrompt(body),
-              },
-            ],
+            error: "Both AI providers failed. Check your API keys and try again.",
+            groqError: String(groqError),
+            geminiError: String(geminiError),
           },
-        ],
-        generationConfig: {
-          temperature: 0.7,
-          topK: 40,
-          topP: 0.95,
-          maxOutputTokens: 8192,
-          responseMimeType: "application/json",
-        },
-      }),
-    });
-
-    if (!geminiResponse.ok) {
-      const errorData = await geminiResponse.json();
-      console.error("Gemini API error:", errorData);
-      return NextResponse.json(
-        { error: "Gemini API call failed", details: errorData },
-        { status: 500 }
-      );
+          { status: 500 }
+        );
+      }
     }
 
-    const geminiData = await geminiResponse.json();
-
-    // Extract the text content from Gemini's response
-    const rawText =
-      geminiData?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-
-    if (!rawText) {
-      return NextResponse.json(
-        { error: "Empty response from Gemini" },
-        { status: 500 }
-      );
-    }
-
-    // Strip any accidental markdown fences just in case
+    // ── 3. Clean & parse JSON ────────────────────────────────────────────────
     const cleaned = rawText
       .replace(/```json/gi, "")
       .replace(/```/g, "")
@@ -179,9 +238,10 @@ export async function POST(req: NextRequest) {
 
     const mealPlan = JSON.parse(cleaned);
 
-    return NextResponse.json(mealPlan);
+    // Attach which provider was actually used (optional — useful for debugging)
+    return NextResponse.json({ ...mealPlan, _provider: usedProvider });
   } catch (error) {
-    console.error("Route error:", error);
+    console.error("[MealMind] Route error:", error);
     return NextResponse.json(
       { error: "Internal server error", details: String(error) },
       { status: 500 }
